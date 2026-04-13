@@ -1,0 +1,329 @@
+# TaskFlow — Backend API
+
+> **Stack:** Java 21 · Spring Boot 3.2 · PostgreSQL 16 · Flyway · JWT · Docker
+
+---
+
+## 1. Overview
+
+TaskFlow is a RESTful task management API. Users register and log in, create projects, and manage tasks within those projects — including assigning tasks to other users, filtering by status, and setting priorities and due dates.
+
+**Tech decisions at a glance:**
+
+| Concern | Choice |
+|---|---|
+| Language | Java 21 (LTS) with virtual threads available |
+| Framework | Spring Boot 3.2 — battle-tested, excellent security + data ecosystem |
+| Auth | JWT (JJWT 0.12), bcrypt cost 12 |
+| DB | PostgreSQL 16 with Flyway migrations |
+| ORM | Spring Data JPA / Hibernate — schema validated not auto-generated |
+| Tests | JUnit 5 + Testcontainers (real PostgreSQL, no mocks) |
+| API collection | Bruno (`taskflow.bru` in repo root) |
+
+---
+
+## 2. Architecture Decisions
+
+### Package structure — by layer, not by feature
+
+```
+com.taskflow
+├── config/        # Spring beans (security, UserDetails)
+├── controller/    # HTTP layer — thin, delegates to service
+├── dto/           # request/ and response/ records — no entity leakage
+│   ├── request/
+│   └── response/
+├── entity/        # JPA entities
+├── exception/     # Domain exceptions + global handler
+├── repository/    # Spring Data interfaces + JPQL queries
+├── security/      # JwtService, JwtAuthFilter
+└── service/       # Business logic — owns transactions
+```
+
+Controllers are deliberately thin: parse input, call service, return response. All authorization logic lives in the service layer, not in annotations or filters, so it's testable without HTTP.
+
+### JWT approach
+
+The JWT filter extracts `user_id` from the token, loads the `User` from the database, and puts it in the `SecurityContext`. This means `@AuthenticationPrincipal User caller` in controllers is a fully hydrated entity — no secondary lookups needed. The tradeoff is one extra DB read per request; acceptable for this scale and avoids stale-token issues where user state has changed.
+
+### Flyway not auto-migrate
+
+`spring.jpa.hibernate.ddl-auto=validate` — Hibernate validates the schema matches entities but never modifies it. Flyway owns schema changes. This is the correct approach for any production system: you get a reproducible, reviewable, rollback-capable migration history.
+
+### Error response consistency
+
+A `GlobalExceptionHandler` catches all exceptions in one place. Domain exceptions (`NotFoundException`, `ForbiddenException`, `ConflictException`) map to specific HTTP codes. `MethodArgumentNotValidException` produces structured field-level errors. The handler intentionally separates `401` (unauthenticated — no/bad token) from `403` (authenticated but not allowed).
+
+
+## 3. Running Locally
+
+Requires: **Docker** and **Docker Compose** only.
+
+```bash
+git clone https://github.com/ansh29verma/taskflow-Anshul
+cd taskflow-[your-name]
+
+cp .env.example .env
+# Optional: edit .env to change ports or set a real JWT_SECRET
+
+docker compose up --build
+```
+
+The API will be available at **http://localhost:8080**.
+
+Flyway migrations run automatically on startup. The container waits for PostgreSQL to be healthy before starting.
+
+**First request to verify it's running:**
+
+```bash
+curl http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"password123"}'
+```
+
+---
+
+## 4. Running Migrations
+
+Migrations run **automatically** when the API container starts (Flyway detects pending migrations and applies them in order).
+
+If you need to run them manually against a local database:
+
+```bash
+# With Docker Compose running:
+docker compose exec api java -jar app.jar --spring.flyway.locations=classpath:db/migration
+```
+
+Migration files are in `src/main/resources/db/migration/`:
+
+| File | Description |
+|---|---|
+| `V1__create_initial_schema.sql` | Users, projects, tasks tables + indexes + trigger |
+| `V2__seed_test_data.sql` | Test user, 1 project, 3 tasks |
+| `V1__create_initial_schema_down.sql` | Manual rollback script (not Flyway-managed) |
+
+---
+
+## 5. Test Credentials
+
+Seeded by `V2__seed_test_data.sql`:
+
+```
+Email:    test@example.com
+Password: password123
+
+Email:    alice@example.com
+Password: password123
+```
+
+---
+
+## 6. API Reference
+
+Import `taskflow.bru` into [Bruno](https://www.usebruno.com/) for a complete runnable collection with auto-captured tokens and IDs.
+
+### Base URL
+```
+http://localhost:8080
+```
+
+### Authentication
+
+**POST /auth/register**
+```json
+// Request
+{ "name": "Jane Doe", "email": "jane@example.com", "password": "password123" }
+
+// 201 Created
+{ "token": "<jwt>", "user": { "id": "uuid", "name": "Jane Doe", "email": "jane@example.com", "createdAt": "..." } }
+
+// 400 — validation failed
+{ "error": "validation failed", "fields": { "email": "must be a valid email" } }
+
+// 409 — duplicate email
+{ "error": "email already in use" }
+```
+
+**POST /auth/login**
+```json
+// Request
+{ "email": "jane@example.com", "password": "password123" }
+
+// 200 OK
+{ "token": "<jwt>", "user": { ... } }
+
+// 401 — wrong credentials
+{ "error": "invalid credentials" }
+```
+
+All subsequent requests require:
+```
+Authorization: Bearer <token>
+```
+
+---
+
+### Projects
+
+**GET /projects** — list projects accessible to caller
+```
+?page=1&limit=20
+```
+```json
+// 200
+{
+  "projects": [ { "id": "uuid", "name": "...", "description": "...", "ownerId": "uuid", "createdAt": "..." } ],
+  "page": { "page": 1, "limit": 20, "total": 3, "totalPages": 1 }
+}
+```
+
+**POST /projects**
+```json
+// Request
+{ "name": "Website Redesign", "description": "Q2 project" }
+
+// 201 Created — returns ProjectResponse
+```
+
+**GET /projects/:id**
+```json
+// 200 — project + all tasks
+{
+  "id": "uuid", "name": "...", "ownerId": "uuid", "createdAt": "...",
+  "tasks": [ { "id": "uuid", "title": "...", "status": "todo", "priority": "high", ... } ]
+}
+```
+
+**PATCH /projects/:id** — owner only
+```json
+{ "name": "New Name", "description": "New description" }
+// 200 — updated project
+// 403 — not the owner
+```
+
+**DELETE /projects/:id** — owner only, cascades to tasks
+```
+204 No Content
+```
+
+**GET /projects/:id/stats** — bonus endpoint
+```json
+// 200
+{
+  "byStatus":   [ { "status": "todo", "count": 2 }, { "status": "done", "count": 1 } ],
+  "byAssignee": [ { "assignee": "Jane Doe", "count": 2 }, { "assignee": "Unassigned", "count": 1 } ]
+}
+```
+
+---
+
+### Tasks
+
+**GET /projects/:id/tasks**
+```
+?status=todo|in_progress|done
+?assignee=<userId>
+?page=1&limit=20
+```
+```json
+// 200
+{ "tasks": [ ... ], "page": { ... } }
+```
+
+**POST /projects/:id/tasks**
+```json
+// Request
+{
+  "title": "Design homepage",
+  "description": "Lo-fi wireframes",
+  "status": "todo",
+  "priority": "high",
+  "assigneeId": "uuid-or-omit",
+  "dueDate": "2026-05-01"
+}
+// 201 — returns TaskResponse
+```
+
+**PATCH /tasks/:id** — project owner or assignee only
+```json
+// All fields optional
+{ "title": "...", "status": "done", "priority": "low", "assigneeId": "uuid", "dueDate": "2026-05-10" }
+// 200 — updated task
+```
+
+**DELETE /tasks/:id** — project owner only
+```
+204 No Content
+```
+
+---
+
+### Common Error Shapes
+
+```json
+// 400 Validation
+{ "error": "validation failed", "fields": { "title": "is required" } }
+
+// 401 Unauthenticated
+{ "error": "unauthorized" }
+
+// 403 Forbidden
+{ "error": "forbidden" }
+
+// 404 Not found
+{ "error": "not found" }
+
+// 409 Conflict
+{ "error": "email already in use" }
+```
+
+---
+
+## 7. Running Tests
+
+Integration tests use Testcontainers — they spin up a real PostgreSQL container automatically. Docker must be running.
+
+```bash
+# From inside the backend directory
+./mvnw test
+
+# Or with Docker Compose already up, exec into a build container
+docker run --rm -v $(pwd):/app -w /app maven:3.9.6-eclipse-temurin-21 mvn test
+```
+
+Tests cover:
+- Registration (success, duplicate email, missing fields)
+- Login (success, wrong password, missing token → 401)
+- Full task lifecycle (create, list, filter, update status, delete)
+- Authorization guards (401 on protected routes without token)
+
+---
+
+## 8. What I'd Do With More Time
+
+**Security hardening:**
+- Refresh tokens with short-lived access tokens (currently 24h is long)
+- Rate limiting on `/auth/*` endpoints to prevent brute force
+- Input sanitisation beyond `@Valid` (XSS on description fields)
+
+**Data model improvements:**
+- Soft deletes with a `deleted_at` column — safer than cascading hard deletes
+- `created_by` on tasks (currently implicit via assignee)
+- Optimistic locking on tasks (`@Version`) to handle concurrent edits cleanly
+
+**API improvements:**
+- `GET /users` endpoint for the frontend to populate assignee dropdowns
+- Cursor-based pagination instead of offset (better for large datasets)
+- `ETag` / `Last-Modified` headers for caching
+
+**Observability:**
+- Structured JSON logging (currently pattern-based)
+- Micrometer metrics → Prometheus scrape endpoint
+- Request tracing with correlation IDs
+
+**Testing:**
+- Contract tests (Spring Cloud Contract) to ensure the Bruno collection stays in sync
+- Load test to establish baseline latency before any optimisation
+
+**Architecture:**
+- Extract a thin `domain` module with pure Java — no Spring deps — so core business rules are portable and testable without framework overhead. The current service layer mixes Spring transaction annotations with business logic, which works but creates coupling.

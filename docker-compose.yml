@@ -1,0 +1,56 @@
+version: "3.9"
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${DB_NAME:-test}
+      POSTGRES_USER:     ${DB_USER:-test}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-test}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${DB_EXPOSE_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-taskflow} -d ${DB_NAME:-taskflow}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - taskflow_net
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      DB_HOST:       postgres
+      DB_PORT:       5432
+      DB_NAME:       ${DB_NAME:-taskflow}
+      DB_USER:       ${DB_USER:-taskflow}
+      DB_PASSWORD:   ${DB_PASSWORD:-taskflow}
+      JWT_SECRET:    ${JWT_SECRET:-change-me-to-a-long-random-secret-in-production-min-256-bits}
+      SERVER_PORT:   8080
+    ports:
+      - "${API_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+    networks:
+      - taskflow_net
+
+volumes:
+  postgres_data:
+
+networks:
+  taskflow_net:
+    driver: bridge
